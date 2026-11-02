@@ -1,12 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - '*'
-  pull_request:
-    branches:
-      - '*'
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 # https://help.github.com/en/actions/automating-your-workflow-with-github-actions/software-installed-on-github-hosted-runners
 
@@ -24,11 +24,13 @@ jobs:
   Test:
     name: JDK ${{ matrix.jdk }}, ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       matrix:
         jdk: [11, 17]
         os: [ubuntu-latest, windows-latest, macos-latest]
-      fail-fast: true
+      # fail-fast off so one leg's failure does not cancel the others' results
+      fail-fast: false
       max-parallel: 4
     steps:
     - uses: actions/checkout@v3
@@ -40,8 +42,80 @@ jobs:
       with:
         distribution: 'temurin'
         java-version: ${{ matrix.jdk }}
+    - name: Set up Maven 3.9.5
+      # Runner-image Maven rejects the duplicate janino dependency in
+      # logback-core-blackbox/pom.xml; 3.9.5 (release era) only warns.
+      uses: stCarolas/setup-maven@v5
+      with:
+        maven-version: 3.9.5
     - name: Install
       # download dependencies, etc, so test log looks better
-      run: mvn -B install
+      shell: bash
+      run: |
+        # Two wall-clock-bound tests overrun on the shared macOS runners:
+        # SocketAppenderMessageLossTest#smallQueueSocketAppender (hard 3000 ms
+        # @Timeout) and SMTPAppender_GreenTest#asynchronousSmoke (1000 ms
+        # executor-termination wait). They are excluded on macOS only (via
+        # surefire's excludesFile, which merges with the pom excludes) and
+        # still run on Linux, Windows and Travis.
+        SEAL_EXCLUDES=""
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          printf '%s\n' '**/SocketAppenderMessageLossTest.java#smallQueueSocketAppender' '**/SMTPAppender_GreenTest.java#asynchronousSmoke' > "$RUNNER_TEMP/seal-excludes.txt"
+          SEAL_EXCLUDES="-Dsurefire.excludesFile=$RUNNER_TEMP/seal-excludes.txt"
+        fi
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          mvn -B -V install -Dtest="${{ inputs.test-filter }}" -Dsurefire.failIfNoSpecifiedTests=false
+        else
+          mvn -B -V install $SEAL_EXCLUDES
+        fi
+    - name: Report skipped tests with reasons
+      # surefire prints only per-module skip counts; list each skipped test
+      # and why (upstream @Disabled / assume) from the XML reports
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Windows" ]; then PY=python; else PY=python3; fi
+        $PY .github/seal/skip-report.py .
+
+  Package:
+    # The public 1.4.11 jars carry Build-Jdk-Spec: 20, CRLF text resources
+    # (a CRLF checkout under `* text=auto`) but LF Maven-generated metadata
+    # (a non-Windows JVM), and were produced by release.sh (install, then
+    # deploy without clean); mirror that here.
+    name: Package logback-classic (JDK 20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 50
+    - name: Re-checkout text files with CRLF line endings
+      run: |
+        git config core.eol crlf
+        git rm -rq --cached .
+        git reset -q --hard HEAD
+    - name: Set up Java 20
+      uses: actions/setup-java@v2
+      with:
+        distribution: 'temurin'
+        java-version: 20
+    - name: Set up Maven 3.9.5
+      # Runner-image Maven rejects the duplicate janino dependency in
+      # logback-core-blackbox/pom.xml; 3.9.5 (release era) only warns.
+      uses: stCarolas/setup-maven@v5
+      with:
+        maven-version: 3.9.5
+    - name: Build jars
+      shell: bash
+      run: |
+        mvn -B install -pl logback-classic -am -Dmaven.test.skip.exec=true
+        mvn -B install -pl logback-classic -am -Dmaven.test.skip.exec=true
+    - name: Upload logback-classic jars
+      uses: actions/upload-artifact@v4
+      with:
+        name: logback-classic-jars
+        path: |
+          logback-classic/target/logback-classic-1.4.11.jar
+          logback-classic/target/logback-classic-1.4.11-tests.jar
+        if-no-files-found: error
 
 
